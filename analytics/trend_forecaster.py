@@ -9,11 +9,31 @@ from typing import Any, Sequence
 import numpy as np
 
 
-MODEL_VERSION = "xgboost-profile-trend-v1"
+MODEL_VERSION = "xgboost-profile-trend-kalman-v2"
 LOOKBACK_SAMPLES = 8
 MIN_HISTORY_SAMPLES = 36
 TREND_WINDOW_SAMPLES = 12
 NON_NUMERIC_UNITS = {"category_code"}
+KALMAN_FILTER_FEATURES = {
+    "hr_bpm",
+    "hrv_ms",
+    "systolic_bp_mmhg",
+    "diastolic_bp_mmhg",
+    "ecg_rr_interval_ms",
+    "spo2_percent",
+    "respiratory_rate_bpm",
+    "skin_temperature_c",
+    "activity_intensity_0_1",
+    "movement_rms_g",
+    "radiation_dose_rate_usv_h",
+    "cabin_temperature_c",
+    "cabin_pressure_kpa",
+    "cabin_humidity_percent",
+    "lighting_lux",
+    "noise_db",
+    "co2_ppm",
+    "o2_percent",
+}
 MISSION_CONTEXT_FEATURES = (
     "mission_elapsed_min",
     "eva_active",
@@ -42,6 +62,9 @@ def forecast_feature(
     ]
     valid_values = [value for value, _ in valid_pairs]
     valid_contexts = [context for _, context in valid_pairs]
+    filter_applied = (
+        feature_name in KALMAN_FILTER_FEATURES and unit not in NON_NUMERIC_UNITS
+    )
     base = {
         "model": MODEL_VERSION,
         "history_samples": len(valid_values),
@@ -53,6 +76,10 @@ def forecast_feature(
         "direction": "unknown",
         "status": "building_history",
         "unit": unit,
+        "input_filter": {
+            "method": "adaptive_scalar_kalman" if filter_applied else None,
+            "applied": filter_applied,
+        },
         "context_features": list(_context_features_for_target(feature_name)),
     }
 
@@ -72,11 +99,16 @@ def forecast_feature(
         values_array,
         _context_matrix(valid_contexts, feature_name),
         base,
+        filter_applied=filter_applied,
     )
 
 
 def _forecast_numeric(
-    values: np.ndarray, contexts: np.ndarray, base: dict[str, Any]
+    values: np.ndarray,
+    contexts: np.ndarray,
+    base: dict[str, Any],
+    *,
+    filter_applied: bool,
 ) -> dict[str, Any]:
     target_count = len(values) - LOOKBACK_SAMPLES
     split = max(LOOKBACK_SAMPLES + 4, int(target_count * 0.8))
@@ -92,7 +124,19 @@ def _forecast_numeric(
     if scale <= 1e-9:
         scale = max(abs(center) * 1e-6, 1e-6)
     normalized = (values - center) / scale
-    features, targets = _lagged_samples(normalized, contexts)
+    history_values = (
+        _adaptive_scalar_kalman(
+            normalized,
+            noise_reference=normalized[:split + LOOKBACK_SAMPLES],
+        )
+        if filter_applied
+        else normalized
+    )
+    features, targets = _lagged_samples(
+        normalized,
+        contexts,
+        history_values=history_values,
+    )
 
     model = _regressor()
     model.fit(features[:split], targets[:split])
@@ -100,7 +144,7 @@ def _forecast_numeric(
     holdout_error = float(np.median(np.abs(holdout_predictions - targets[split:])) * scale)
 
     current_features = np.hstack(
-        (normalized[-LOOKBACK_SAMPLES:], contexts[-1])
+        (history_values[-LOOKBACK_SAMPLES:], contexts[-1])
     ).reshape(1, -1)
     next_value = float(model.predict(current_features)[0] * scale + center)
     normalized_trend = _normalized_recent_trend(values[-TREND_WINDOW_SAMPLES:])
@@ -155,13 +199,17 @@ def _forecast_category(
 
 
 def _lagged_samples(
-    values: np.ndarray, contexts: np.ndarray
+    values: np.ndarray,
+    contexts: np.ndarray,
+    *,
+    history_values: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
+    input_values = values if history_values is None else history_values
     features = np.asarray(
         [
             np.hstack(
                 (
-                    values[index - LOOKBACK_SAMPLES:index],
+                    input_values[index - LOOKBACK_SAMPLES:index],
                     contexts[index - 1],
                 )
             )
@@ -171,6 +219,41 @@ def _lagged_samples(
     )
     targets = values[LOOKBACK_SAMPLES:].astype(np.float64)
     return features, targets
+
+
+def _adaptive_scalar_kalman(
+    values: np.ndarray,
+    *,
+    noise_reference: np.ndarray | None = None,
+) -> np.ndarray:
+    if len(values) < 2:
+        return values.copy()
+
+    reference = values if noise_reference is None else noise_reference
+    differences = np.diff(reference)
+    difference_center = float(np.median(differences))
+    difference_mad = float(np.median(np.abs(differences - difference_center)))
+    measurement_variance = max(
+        (1.4826 * difference_mad / math.sqrt(2.0)) ** 2,
+        1e-4,
+    )
+    process_variance = measurement_variance * 0.1
+
+    estimate = float(values[0])
+    estimate_variance = measurement_variance
+    filtered = np.empty_like(values)
+    filtered[0] = estimate
+    for index, measurement in enumerate(values[1:], start=1):
+        predicted_variance = estimate_variance + process_variance
+        innovation = float(measurement) - estimate
+        innovation_variance = predicted_variance + measurement_variance
+        gain = predicted_variance / innovation_variance
+        if abs(innovation) > 3.0 * math.sqrt(innovation_variance):
+            gain = max(gain, 0.85)
+        estimate += gain * innovation
+        estimate_variance = (1.0 - gain) * predicted_variance
+        filtered[index] = estimate
+    return filtered
 
 
 def _context_features_for_target(feature_name: str | None) -> tuple[str, ...]:

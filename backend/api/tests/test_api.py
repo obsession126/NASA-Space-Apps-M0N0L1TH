@@ -276,7 +276,7 @@ class MissionApiTests(APITestCase):
         self.assertGreaterEqual(len(heart_rate["history"]), 8)
         self.assertEqual(
             heart_rate["trend_model"]["model"],
-            "xgboost-profile-trend-v1",
+            "xgboost-profile-trend-kalman-v2",
         )
         self.assertEqual(heart_rate["trend_model"]["status"], "building_history")
         self.assertEqual(report["summary"]["trend_model_ready_metric_count"], 0)
